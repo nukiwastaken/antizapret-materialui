@@ -1,0 +1,46 @@
+{
+  "name": "netbridge-mac",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A desktop dashboard for Flowseal's ZapretMac and TG WS Proxy",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "build": "vite build",
+    "dist:mac": "npm run build && electron-builder --mac dmg zip",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.0",
+    "@mui/icons-material": "^6.4.0",
+    "@mui/material": "^6.4.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.3.0",
+    "concurrently": "^9.2.1",
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0",
+    "vite": "^8.3.8",
+    "wait-on": "^8.0.5"
+  },
+  "build": {
+    "appId": "com.netbridge.mac",
+    "productName": "Netbridge",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "identity": null,
+      "target": ["dmg", "zip"]
+    }
+  }
+}
