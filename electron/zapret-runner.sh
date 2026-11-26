@@ -10,9 +10,11 @@ MODE=$5
 PREFERRED=${6:-}
 BASE='/Library/Application Support/ZapretMac'
 WORK="$DATA/netbridge-test"
+if [ "$MODE" = stop ]; then WORK="$DATA/netbridge-stop"; fi
 STARTED=$(/bin/date +%s)
 ROLLING_BACK=0
 PROBE_PIDS=''
+PROBE_DIR=''
 case "$DATA" in /Users/*/'Library/Application Support/ZapretMac') ;; *) exit 2 ;; esac
 case "$UID_NUMBER:$GID_NUMBER" in *[!0-9:]*|:|*:|:*) exit 2 ;; esac
 [ "$UID_NUMBER" -gt 0 ] || exit 2
@@ -31,15 +33,9 @@ check_abort() {
         exit 124
     fi
 }
-terminate_probe() {
-    # Only descendants of our tracked probe jobs, never the system engine.
-    for CHILD in $(/usr/bin/pgrep -P "$1" 2>/dev/null || true); do
-        terminate_probe "$CHILD"
-    done
-    /bin/kill -KILL "$1" 2>/dev/null || true
-}
 stop_probes() {
-    for PROBE_PID in $PROBE_PIDS; do terminate_probe "$PROBE_PID"; done
+    # sudo forwards TERM to curl. Track sudo directly, not shell pipeline wrappers.
+    for PROBE_PID in $PROBE_PIDS; do /bin/kill -TERM "$PROBE_PID" 2>/dev/null || true; done
     for PROBE_PID in $PROBE_PIDS; do wait "$PROBE_PID" 2>/dev/null || true; done
     PROBE_PIDS=''
 }
@@ -75,6 +71,7 @@ LOCK=/var/run/netbridge-zapret.lock
 /bin/mkdir "$LOCK" 2>/dev/null || { progress 'Другая операция Netbridge ещё выполняется; если приложение аварийно завершилось, перезагрузите Mac'; exit 6; }
 cleanup() {
     stop_probes
+    if [ -n "$PROBE_DIR" ]; then /bin/rm -rf "$PROBE_DIR"; fi
     /bin/rmdir "$LOCK" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -83,8 +80,29 @@ if /usr/bin/pgrep -x ZapretMac >/dev/null 2>&1; then
     progress 'Закройте оригинальное приложение ZapretMac перед управлением через Netbridge'
     exit 6
 fi
-if [ "$MODE" = stop ]; then /bin/sh "$SOURCE/stop.sh"; exit 0; fi
+if [ "$MODE" = stop ]; then
+    TRUSTED=1
+    for ITEM in '/Library/Application Support' "$BASE" "$BASE/stop.sh"; do
+        if [ ! -L "$ITEM" ] && META=$(/usr/bin/stat -f '%u %Lp' "$ITEM" 2>/dev/null); then
+            OWNER=${META%% *}
+            PERMS=${META#* }
+            case "$PERMS" in
+                ''|*[!0-7]*) ;;
+                *) if [ "$OWNER" = 0 ] && [ "$(( 0$PERMS & 022 ))" -eq 0 ]; then continue; fi ;;
+            esac
+        fi
+        TRUSTED=0
+        break
+    done
+    if [ "$TRUSTED" -ne 1 ] || [ ! -f "$BASE/stop.sh" ]; then
+        progress 'Не найден безопасный системный скрипт остановки ZapretMac'
+        exit 8
+    fi
+    /bin/sh "$BASE/stop.sh"
+    exit 0
+fi
 check_abort
+PROBE_DIR=$(/usr/bin/mktemp -d /private/tmp/netbridge-probes.XXXXXXXX)
 # The route may change while the macOS authorization dialog is open.
 ROUTE=$(/sbin/route -n get default 2>/dev/null || true)
 IFACE=$(printf '%s\n' "$ROUTE" | /usr/bin/awk '/^[[:space:]]*interface:/{print $2; exit}')
@@ -151,48 +169,53 @@ else
     exit 1
 fi
 ready
-probe() {
-    NAME=$1
-    URL=$2
-    EXPECTED=$3
-    OUT=$4
-    VALUE=$(as_user /usr/bin/curl --noproxy '*' --proto '=https' --connect-timeout 3 --max-time 8 \
+start_probe() {
+    /usr/bin/sudo -n -u "#$UID_NUMBER" -H /usr/bin/curl -q --noproxy '*' --proto '=https' --connect-timeout 3 --max-time 8 \
         --max-filesize 2097152 --silent --show-error --output /dev/null \
-        --write-out '%{http_code}\t%{time_total}' "$URL" 2>/dev/null) || VALUE='000	8'
+        --write-out '%{http_code}\t%{time_total}' "$1" >"$PROBE_DIR/$2" 2>/dev/null &
+    LAST_PID=$!
+    PROBE_PIDS="$PROBE_PIDS $LAST_PID"
+}
+finish_probe() {
+    NAME=$1
+    EXPECTED=$2
+    VALUE='000	8'
+    if wait "$3"; then VALUE=$(/bin/cat "$PROBE_DIR/$NAME"); fi
     CODE=$(printf '%s\n' "$VALUE" | /usr/bin/cut -f1)
     TIME=$(printf '%s\n' "$VALUE" | /usr/bin/cut -f2)
     OK=0
     [ "$CODE" != "$EXPECTED" ] || OK=1
-    printf '%s\t%s\t%s\t%s\n' "$NAME" "$OK" "$CODE" "$TIME" | as_user /usr/bin/tee "$OUT" >/dev/null
+    printf '%s\t%s\t%s\t%s\n' "$NAME" "$OK" "$CODE" "$TIME" >>"$PROBE_DIR/metrics"
 }
 measure() {
-    PREFIX=$1
+    : >"$PROBE_DIR/metrics"
     ROUND=1
     while [ "$ROUND" -le 2 ]; do
         check_abort
-        probe youtube https://www.youtube.com/generate_204 204 "$WORK/$PREFIX-$ROUND-youtube" &
-        P1=$!
-        probe thumbnail https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg 200 "$WORK/$PREFIX-$ROUND-thumbnail" &
-        P2=$!
-        probe video-route https://redirector.googlevideo.com/report_mapping 200 "$WORK/$PREFIX-$ROUND-video" &
-        P3=$!
-        PROBE_PIDS="$P1 $P2 $P3"
+        start_probe https://www.youtube.com/generate_204 youtube
+        P1=$LAST_PID
+        start_probe https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg thumbnail
+        P2=$LAST_PID
+        start_probe https://redirector.googlevideo.com/report_mapping video-route
+        P3=$LAST_PID
         while /bin/kill -0 "$P1" 2>/dev/null ||
               /bin/kill -0 "$P2" 2>/dev/null ||
               /bin/kill -0 "$P3" 2>/dev/null; do
             check_abort
             /bin/sleep 0.2
         done
-        wait "$P1" "$P2" "$P3" || return 1
+        finish_probe youtube 204 "$P1"
+        finish_probe thumbnail 200 "$P2"
+        finish_probe video-route 200 "$P3"
         PROBE_PIDS=''
         ROUND=$((ROUND + 1))
     done
-    METRICS=$(/usr/bin/awk -F '\t' '{n+=$2; t+=$4; if ($1=="youtube") y+=$2} END {printf "%d\t%.4f\t%d\n", n,t,y}' "$WORK/$PREFIX"-*)
+    METRICS=$(/usr/bin/awk -F '\t' '{n+=$2; t+=$4; if ($1=="youtube") y+=$2} END {printf "%d\t%.4f\t%d\n", n,t,y}' "$PROBE_DIR/metrics")
 }
 
 if [ -n "$PREFERRED" ]; then
     progress 'Проверка сохранённого профиля'
-    measure cached
+    measure
     SCORE=$(printf '%s' "$METRICS" | /usr/bin/cut -f1)
     YOUTUBE=$(printf '%s' "$METRICS" | /usr/bin/cut -f3)
     check_abort
@@ -221,7 +244,7 @@ while IFS="$TAB" read -r STRATEGY NAME; do
     write_state selected-strategy "$STRATEGY"
     # Keep the user's IPSet mode so testing and the final application agree.
     if ! restart_ready; then continue; fi
-    measure "candidate-$INDEX"
+    measure
     SCORE=$(printf '%s' "$METRICS" | /usr/bin/cut -f1)
     TIME=$(printf '%s' "$METRICS" | /usr/bin/cut -f2)
     YOUTUBE=$(printf '%s' "$METRICS" | /usr/bin/cut -f3)
@@ -239,7 +262,7 @@ check_abort
 progress 'Повторная проверка выбранной стратегии'
 write_state selected-strategy "$BEST"
 restart_ready
-measure final
+measure
 SCORE=$(printf '%s' "$METRICS" | /usr/bin/cut -f1)
 YOUTUBE=$(printf '%s' "$METRICS" | /usr/bin/cut -f3)
 [ "$YOUTUBE" -eq 2 ] && [ "$SCORE" -ge 4 ] || exit 4

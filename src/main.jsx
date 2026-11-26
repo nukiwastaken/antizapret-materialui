@@ -9,6 +9,7 @@ import {
 import {
   Brightness4, ContentCopy, Dashboard,
   Palette, PlayArrow, Send, Shield, Stop, Tune, YouTube, AutoFixHigh, Assessment,
+  FileDownload, FolderOpen, HealthAndSafety, Refresh,
 } from "@mui/icons-material";
 import "./style.css";
 import logo from "../assets/netbridge.png";
@@ -16,6 +17,11 @@ import { version } from "../package.json";
 
 const seed = { accent: "#267b70", mode: "light", radius: 8, compact: false };
 const palettes = ["#267b70", "#315da8", "#b14a45", "#7954a3", "#247b9a", "#60734a"];
+const names = { zapret: "Zapret", telegram: "Telegram", diagnostics: "Диагностика" };
+const operations = { start: "Запуск", stop: "Остановка", optimize: "Автоподбор", import: "Импорт", connect: "Открытие Telegram", check: "Проверка HTTPS", invalidate: "Результат устарел" };
+const outcomes = { started: "Начато", running: "В процессе", ok: "Успешно", interrupted: "Прервано", cancelled: "Отменено", failed: "Не удалось", partial: "Частично", stale: "Устарело", route: "Сменился маршрут", sleep: "Сон или пробуждение Mac", service: "Изменилось состояние сервиса" };
+const endpoints = { youtube: "YouTube", thumbnail: "Превью", "video-route": "Маршрутизатор Google Video" };
+const formatDate = (value) => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString("ru-RU") : "—";
 
 function App() {
   const [prefs, setPrefs] = useState(() => {
@@ -28,15 +34,20 @@ function App() {
     telegram: { running: false, busy: false, installed: false },
   });
   const [reportOpen, setReportOpen] = useState(false);
+  const [diagnostics, setDiagnostics] = useState({ result: null, events: [], checking: false });
   const [page, setPage] = useState("overview");
   useEffect(() => {
     if (!window.netbridge) return;
     let mounted = true;
     const unsubscribe = window.netbridge.onState((state) => { if (mounted) setServices(state); });
+    const unsubscribeDiagnostics = window.netbridge.onDiagnostics((state) => { if (mounted) setDiagnostics(state); });
     window.netbridge.state().then((result) => {
       if (mounted && result.ok) setServices(result.value);
     }).catch((error) => { if (mounted) setToast(error.message); });
-    return () => { mounted = false; unsubscribe(); };
+    window.netbridge.diagnostics().then((result) => {
+      if (mounted && result.ok) setDiagnostics(result.value);
+    }).catch((error) => { if (mounted) setToast(error.message); });
+    return () => { mounted = false; unsubscribe(); unsubscribeDiagnostics(); };
   }, []);
   const theme = useMemo(() => createTheme({
     palette: {
@@ -62,10 +73,11 @@ function App() {
     try {
       const result = await fn(window.netbridge);
       if (!result.ok) setToast(result.error);
-      else if (success) setToast(success);
+      else if (success && result.value !== false) setToast(success);
     } catch (error) { setToast(error.message); }
   };
-  const toggle = (key) => action((api) => api.toggle(key, !services[key].running));
+  const toggle = (key) => action((api) => api.toggle(key, !(services[key].running || services[key].loaded)));
+  const importComponent = (key) => action((api) => api.importComponent(key), "Компонент проверен и установлен");
   const active = Object.values(services).filter((service) => service.running).length;
   const busy = Object.values(services).some((service) => service.busy);
 
@@ -76,8 +88,9 @@ function App() {
         <Box component="aside" className="sidebar">
           <Box className="brand"><img className="brand-mark" src={logo} alt="Логотип Netbridge" draggable={false} /><Typography className="brand-name" fontWeight={750}>netbridge</Typography></Box>
           <Typography className="nav-label">РАБОЧЕЕ ПРОСТРАНСТВО</Typography>
-          <Button className={`nav-item ${page === "overview" ? "selected" : ""}`} startIcon={<Dashboard />} onClick={() => setPage("overview")}>Обзор</Button>
-          <Button className={`nav-item ${page === "appearance" ? "selected" : ""}`} startIcon={<Palette />} onClick={() => setPage("appearance")}>Оформление</Button>
+          <Button className={`nav-item ${page === "overview" ? "selected" : ""}`} startIcon={<Dashboard />} aria-current={page === "overview" ? "page" : undefined} onClick={() => setPage("overview")}>Обзор</Button>
+          <Button className={`nav-item ${page === "diagnostics" ? "selected" : ""}`} startIcon={<HealthAndSafety />} aria-current={page === "diagnostics" ? "page" : undefined} onClick={() => setPage("diagnostics")}>Диагностика</Button>
+          <Button className={`nav-item ${page === "appearance" ? "selected" : ""}`} startIcon={<Palette />} aria-current={page === "appearance" ? "page" : undefined} onClick={() => setPage("appearance")}>Оформление</Button>
           <Box className="sidebar-bottom">
             <Paper className="privacy-note" elevation={0}><Shield color="primary" fontSize="small" /><Typography variant="caption">Flowseal · ZapretMac 1.1.2<br />TG WS Proxy 1.12.0</Typography></Paper>
           </Box>
@@ -92,13 +105,15 @@ function App() {
             <Paper className="status-strip" elevation={0}><span className={`live-dot ${active ? "" : "inactive"}`} /><Box flex={1}><Typography fontWeight={650}>{busy ? "Настройка подключения" : active ? `Активных сервисов: ${active}` : "Сервисы выключены"}</Typography><Typography variant="body2" color="text.secondary">{window.netbridge ? "Локальное устройство · macOS" : "Предпросмотр · без доступа к сервисам"}</Typography></Box><Typography variant="caption" color="text.secondary">Netbridge {version}</Typography></Paper>
             <Typography className="section-title">СЕРВИСЫ</Typography>
             <Box className="service-grid">
-              <ServiceCard icon={<YouTube />} color="#dc514d" label="ВИДЕО" title="YouTube" desc="ZapretMac · автоматический подбор стратегии" state={services.zapret} onToggle={() => toggle("zapret")} onOptimize={() => action((api) => api.optimize())} onCancel={() => action((api) => api.cancel())} />
-              <ServiceCard icon={<Send />} color="#398fbd" label="МЕССЕНДЖЕР" title="Telegram" desc="TG WS Proxy · локальный MTProto через WebSocket" state={services.telegram} onToggle={() => toggle("telegram")} />
+              <ServiceCard icon={<YouTube />} color="#dc514d" label="ВИДЕО" title="YouTube" desc="ZapretMac · автоматический подбор стратегии" state={services.zapret} onToggle={() => toggle("zapret")} onOptimize={() => action((api) => api.optimize())} onCancel={() => action((api) => api.cancel())} onImport={() => importComponent("zapret")} archive="ZapretMac ZIP" />
+              <ServiceCard icon={<Send />} color="#398fbd" label="МЕССЕНДЖЕР" title="Telegram" desc="TG WS Proxy · локальный MTProto через WebSocket" state={services.telegram} onToggle={() => toggle("telegram")} onImport={() => importComponent("telegram")} archive="TG WS Proxy DMG" />
             </Box>
             <Paper className="proxy-row" elevation={0}><Avatar sx={{ bgcolor: "#e9f1fa", color: "#3472a8" }}><Send /></Avatar><Box flex={1}><Typography fontWeight={650}>Прокси Telegram</Typography><Typography variant="body2" color="text.secondary">{services.telegram.running ? "Локальный порт слушает · маршрут Telegram не проверен" : "Ожидает запуска"}</Typography></Box><Typography className="proxy-address">{services.telegram.address || "—"}</Typography><Tooltip title="Скопировать ссылку с ключом"><span><IconButton disabled={!services.telegram.running} onClick={() => action((api) => api.copyTelegram(), "Ссылка скопирована")}><ContentCopy fontSize="small" /></IconButton></span></Tooltip><Button disabled={!services.telegram.running} onClick={() => action((api) => api.connectTelegram())} startIcon={<Send />}>Подключить</Button></Paper>
-            {services.zapret.strategy && <Box className="strategy-row"><Typography variant="body2" color="text.secondary">Стратегия: <strong>{services.zapret.strategy}</strong></Typography><Button size="small" startIcon={<Assessment />} disabled={!services.zapret.report} onClick={() => setReportOpen(true)}>Отчёт</Button></Box>}
+            {(services.zapret.strategy || services.zapret.attempt || services.zapret.report) && <Box className="strategy-row"><Typography variant="body2" color="text.secondary">Стратегия: <strong>{services.zapret.strategy || "—"}</strong></Typography><Button size="small" startIcon={<Assessment />} disabled={!services.zapret.attempt && !services.zapret.report} onClick={() => setReportOpen(true)}>Отчёт</Button></Box>}
             <Box className="footnote"><Shield fontSize="small" /><Typography variant="caption">Zapret требует разрешения администратора. Подбор временно переключает сетевые стратегии; HTTPS-проверки не гарантируют воспроизведение видео. Подключение прокси подтверждается в Telegram.</Typography></Box>
-          </Box> : <Box className="content appearance">
+          </Box> : page === "diagnostics" ? <DiagnosticsPage state={diagnostics} busy={busy}
+            onCheck={() => action((api) => api.check())}
+            onExport={() => action((api) => api.exportHistory(), "История сохранена")} /> : <Box className="content appearance">
             <Typography variant="h4" fontWeight={720}>Оформление</Typography><Typography color="text.secondary" mt={0.7}>Подстройте интерфейс под себя.</Typography>
             <Paper className="settings-panel" elevation={0}>
               <Box className="setting-line"><Box><Typography fontWeight={650}>Цвет акцента</Typography><Typography variant="body2" color="text.secondary">Кнопки и активные элементы</Typography></Box><Stack direction="row" spacing={1}>{palettes.map((color) => <Tooltip key={color} title={color}><IconButton className={`swatch ${prefs.accent === color ? "active" : ""}`} style={{ "--swatch": color }} onClick={() => savePrefs({ ...prefs, accent: color })} /></Tooltip>)}</Stack></Box><Divider />
@@ -113,8 +128,13 @@ function App() {
         <DialogTitle>Результаты автоподбора</DialogTitle><DialogContent>
           <Typography variant="body2" color="text.secondary" mb={2}>По два HTTPS-запроса к YouTube, превью и маршрутизатору Google Video. Приоритет: число успешных ответов, затем суммарная задержка. Ответ Google Video не подтверждает загрузку видеопотока. Браузерный QUIC/HTTP3 и воспроизведение этим тестом не проверяются.</Typography>
           {services.zapret.report?.configRevision === "youtube-quic-1" && <Alert severity="info" sx={{ mb: 2 }}>Домены списка Google/YouTube включены в QUIC-профиль. Это настройка правил, а не подтверждение воспроизведения видео.</Alert>}
-          <Typography variant="body2">{services.zapret.report?.cached ? "Сохранённый профиль · повторная проверка пройдена" : "Выбранная стратегия"}: {services.zapret.report?.strategy}</Typography>
-          <Table size="small"><TableHead><TableRow><TableCell>Стратегия</TableCell><TableCell>HTTPS</TableCell><TableCell>Время, с</TableCell><TableCell>YouTube</TableCell></TableRow></TableHead><TableBody>{(services.zapret.report?.results || "").split("\n").filter(Boolean).map((line) => { const [id, score, time, yt] = line.split("\t"); return <TableRow key={id} selected={id === services.zapret.report?.strategy}><TableCell>{id}</TableCell><TableCell>{score}/6</TableCell><TableCell>{time}</TableCell><TableCell>{yt}/2</TableCell></TableRow>; })}</TableBody></Table>
+          {services.zapret.attempt && <Typography variant="body2" mb={1}>Последняя попытка: {outcomes[services.zapret.attempt.outcome]} · {formatDate(services.zapret.attempt.finishedAt || services.zapret.attempt.startedAt)}</Typography>}
+          {services.zapret.reportNotSaved && <Alert severity="warning" sx={{ mb: 2 }}>Отчёт не удалось сохранить на диск.</Alert>}
+          {services.zapret.report ? <>
+            <Typography variant="body2">Последняя успешная проверка: {formatDate(services.zapret.report.verifiedAt || services.zapret.report.testedAt)} · {services.zapret.report.strategy}</Typography>
+            {services.zapret.report.cached && <Typography variant="caption" color="text.secondary">Повторно проверен сохранённый профиль. Таблица от {formatDate(services.zapret.report.testedAt)}.</Typography>}
+            {services.zapret.report.results && <Table size="small"><TableHead><TableRow><TableCell>Стратегия</TableCell><TableCell>HTTPS</TableCell><TableCell>Время, с</TableCell><TableCell>YouTube</TableCell></TableRow></TableHead><TableBody>{services.zapret.report.results.split("\n").filter(Boolean).map((line) => { const [id, score, time, yt] = line.split("\t"); return <TableRow key={id} selected={id === services.zapret.report?.strategy}><TableCell>{id}</TableCell><TableCell>{score}/6</TableCell><TableCell>{time}</TableCell><TableCell>{yt}/2</TableCell></TableRow>; })}</TableBody></Table>}
+          </> : <Typography variant="body2" color="text.secondary">Успешного подбора пока не было.</Typography>}
         </DialogContent><DialogActions><Button onClick={() => setReportOpen(false)}>Закрыть</Button></DialogActions>
       </Dialog>
       <Snackbar open={Boolean(toast)} autoHideDuration={7000} onClose={() => setToast("")}><Alert severity="info" variant="filled" onClose={() => setToast("")}>{toast}</Alert></Snackbar>
@@ -122,15 +142,51 @@ function App() {
   );
 }
 
-function ServiceCard({ icon, color, label, title, desc, state, onToggle, onOptimize, onCancel }) {
+function DiagnosticsPage({ state, busy, onCheck, onExport }) {
+  const { result, checking, events, warning, suspended } = state;
+  return <Box className="content diagnostics">
+    <Stack direction="row" justifyContent="space-between" alignItems="flex-start" className="heading">
+      <Typography variant="h4" fontWeight={720}>Диагностика</Typography>
+      <Button variant="contained" startIcon={<Refresh />} disabled={checking || suspended || busy} onClick={onCheck}>Проверить сейчас</Button>
+    </Stack>
+    {checking && <Box mb={2} role="status"><LinearProgress /><Typography variant="caption">Проверяем подключение…</Typography></Box>}
+    {result ? <>
+      {result.stale && <Alert severity="warning" sx={{ mb: 2 }}>Результат устарел: {outcomes[result.stale]}.</Alert>}
+      <Typography variant="body2" color="text.secondary" mb={1}>Проверено: {formatDate(result.at)}</Typography>
+      <Box component="dl" className="diagnostic-list">
+        <dt>Сервис Zapret</dt><dd>{result.zapretRunning ? "Работает" : "Не готов"}</dd>
+        <dt>Локальный прокси Telegram</dt><dd>{result.telegramListening ? "Слушает порт" : "Не слушает порт"}</dd>
+        {result.https.map(({ id, ok, code, ms }) => <React.Fragment key={id}>
+          <dt>{endpoints[id]}</dt><dd>{code === null ? "Нет ответа HTTPS" : `${ok ? "Доступен" : "Неожиданный ответ"} · HTTP ${code} · ${ms} мс`}</dd>
+        </React.Fragment>)}
+        <dt>Воспроизведение видео</dt><dd>Не проверялось</dd>
+        <dt>Доставка сообщений Telegram</dt><dd>Не проверялась</dd>
+      </Box>
+    </> : !checking && <Typography color="text.secondary">Проверок ещё не было.</Typography>}
+    <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1} sx={{ mt: 4, mb: 1 }}>
+      <Typography variant="h6">История</Typography>
+      <Button size="small" startIcon={<FileDownload />} disabled={!events.length} onClick={onExport}>Экспорт JSON</Button>
+    </Stack>
+    {warning && <Alert severity="warning" sx={{ mb: 1 }}>Историю не удалось сохранить на диск.</Alert>}
+    {events.length ? <Box component="ol" className="event-list">{events.map((event, index) => <li key={`${event.at}-${index}`}>
+      <Box><Typography variant="body2" fontWeight={650}>{names[event.service]} · {operations[event.operation]}</Typography>
+        <Typography variant="caption" color="text.secondary">{outcomes[event.outcome]}</Typography></Box>
+      <Typography component="time" dateTime={event.at} variant="caption" color="text.secondary">{formatDate(event.at)}</Typography>
+    </li>)}</Box> : <Typography variant="body2" color="text.secondary">Событий пока нет.</Typography>}
+  </Box>;
+}
+
+function ServiceCard({ icon, color, label, title, desc, state, onToggle, onOptimize, onCancel, onImport, archive }) {
+  const enabled = state.running || state.loaded;
   return <Paper className="service-card" elevation={0}>
-    <Stack direction="row" justifyContent="space-between" alignItems="center"><Avatar sx={{ bgcolor: `${color}16`, color }}>{icon}</Avatar><span className={`state ${state.running ? "on" : ""}`}><i />{state.busy ? "Настройка…" : state.running ? "Сервис работает" : "Выключен"}</span></Stack>
+    <Stack direction="row" justifyContent="space-between" alignItems="center"><Avatar sx={{ bgcolor: `${color}16`, color }}>{icon}</Avatar><span className={`state ${state.running ? "on" : ""}`}><i />{state.busy ? "Настройка…" : state.running ? "Сервис работает" : state.loaded ? "Сервис не готов" : "Выключен"}</span></Stack>
     <Box mt={2.5}><Typography variant="overline" color="text.secondary">{label}</Typography><Typography variant="h5" fontWeight={700}>{title}</Typography><Typography color="text.secondary" variant="body2" mt={1}>{desc}</Typography></Box>
     {state.busy && <Box mt={2}><LinearProgress /><Typography variant="caption" color="text.secondary" display="block" mt={1} role="status">{state.message}</Typography></Box>}
     {state.error && <Alert severity="error" sx={{ mt: 2, overflowWrap: "anywhere", fontSize: 12 }}>{state.error}</Alert>}
     <Stack direction="row" spacing={1} mt="auto" pt={3} flexWrap="wrap" useFlexGap>
-      <Button disabled={state.busy} variant="contained" startIcon={state.running ? <Stop /> : <PlayArrow />} onClick={onToggle}>{state.running ? "Выключить" : "Включить"}</Button>
+      <Button disabled={state.busy} variant="contained" startIcon={enabled ? <Stop /> : <PlayArrow />} onClick={onToggle}>{enabled ? "Выключить" : "Включить"}</Button>
       {onOptimize && <Tooltip title="Повторно подобрать стратегию"><span><IconButton color="primary" disabled={state.busy} onClick={onOptimize} aria-label="Автоподбор стратегии"><AutoFixHigh /></IconButton></span></Tooltip>}
+      <Tooltip title={`Импорт ${archive}`}><span><IconButton color="primary" disabled={state.busy || enabled} onClick={onImport} aria-label={`Импорт ${archive}`}><FolderOpen /></IconButton></span></Tooltip>
       {onCancel && state.busy && state.cancellable && <Button onClick={onCancel} startIcon={<Stop />}>Отменить</Button>}
     </Stack>
   </Paper>;

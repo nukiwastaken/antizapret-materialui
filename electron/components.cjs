@@ -52,12 +52,12 @@ async function validateLinks(root, current = root, realRoot = null) {
   }
 }
 
-async function verifyBundle(bundle, spec) {
+async function verifyBundle(bundle, spec, run) {
   await validateLinks(bundle);
-  const { stdout } = await execute("/usr/libexec/PlistBuddy", ["-c", "Print :CFBundleIdentifier", path.join(bundle, "Contents/Info.plist")]);
+  const { stdout } = await run("/usr/libexec/PlistBuddy", ["-c", "Print :CFBundleIdentifier", path.join(bundle, "Contents/Info.plist")]);
   if (stdout.trim() !== spec.bundleId) throw new Error("Неверный идентификатор компонента");
   await fs.access(path.join(bundle, "Contents/MacOS", spec.executable), 1);
-  await execute("/usr/bin/codesign", ["--verify", "--deep", "--strict", bundle]);
+  await run("/usr/bin/codesign", ["--verify", "--deep", "--strict", bundle]);
 }
 
 class ComponentInstaller {
@@ -84,22 +84,43 @@ class ComponentInstaller {
   async ensure(key) {
     const spec = component(key);
     if (await this.installed(key)) {
-      await verifyBundle(this.location(key), spec);
+      await verifyBundle(this.location(key), spec, this.run);
       return this.location(key);
     }
+    return this.install(key);
+  }
+
+  async import(key, filename) {
+    if (path.extname(filename).toLowerCase() !== path.extname(component(key).asset)) {
+      throw new Error("Выбран архив неподходящего формата");
+    }
+    return this.install(key, async (archive) => {
+      const info = await fs.lstat(filename);
+      if (!info.isFile() || info.size > 200_000_000) throw new Error("Выберите обычный архив размером до 200 МБ");
+      await fs.copyFile(filename, archive);
+    });
+  }
+
+  async install(key, localCopy) {
+    const spec = component(key);
     await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
     const scratch = await fs.mkdtemp(path.join(this.root, ".install-"));
     let mounted = false;
     const mount = path.join(scratch, "mount");
     try {
-      this.notify(key, { phase: "download", message: "Загрузка официальной сборки…" });
       const archive = path.join(scratch, spec.asset);
-      const url = `https://github.com/${spec.repo}/releases/download/${spec.version}/${spec.asset}`;
-      await this.run("/usr/bin/curl", [
-        "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
-        "--connect-timeout", "15", "--max-time", "300", "--retry", "2",
-        "--max-filesize", "200000000", "--output", archive, url,
-      ], { timeout: 930000, maxBuffer: 1024 * 1024 });
+      if (localCopy) {
+        this.notify(key, { phase: "import", message: "Чтение локального архива…" });
+        await localCopy(archive);
+      } else {
+        this.notify(key, { phase: "download", message: "Загрузка официальной сборки…" });
+        const url = `https://github.com/${spec.repo}/releases/download/${spec.version}/${spec.asset}`;
+        await this.run("/usr/bin/curl", [
+          "-q", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
+          "--connect-timeout", "15", "--max-time", "300", "--retry", "2",
+          "--max-filesize", "200000000", "--output", archive, url,
+        ], { timeout: 930000, maxBuffer: 1024 * 1024 });
+      }
       this.notify(key, { phase: "verify", message: "Проверка SHA-256 и подписи…" });
       if (await digest(archive) !== spec.sha256) throw new Error("SHA-256 не совпадает. Компонент не установлен.");
       const extracted = path.join(scratch, "extracted");
@@ -119,7 +140,7 @@ class ComponentInstaller {
         }
       }
       const bundle = path.join(extracted, spec.bundle);
-      await verifyBundle(bundle, spec);
+      await verifyBundle(bundle, spec, this.run);
       await fs.writeFile(path.join(extracted, "installed.json"), JSON.stringify({ version: spec.version, sha256: spec.sha256 }));
       const destination = path.dirname(this.location(key));
       await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });

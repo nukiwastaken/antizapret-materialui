@@ -1,8 +1,34 @@
-# Netbridge for macOS 1.1.5
+# Netbridge для macOS
 
-Material UI dashboard for Flowseal's ZapretMac (YouTube) and TG WS Proxy
-(Telegram), with light/dark themes, accent colors, density and corner settings.
-Requires macOS 14 or newer. This is an independent integration, not a Flowseal release.
+Netbridge объединяет ZapretMac для YouTube и локальный TG WS Proxy для Telegram
+в одном приложении. Сервисы можно включать и выключать из окна или строки меню
+macOS. Это независимый проект, не официальный релиз Flowseal.
+
+### Скачать и запустить
+
+1. Откройте [релиз 1.2.0](https://github.com/nukiwastaken/antizapret-materialui/releases/tag/v1.2.0)
+   и скачайте DMG для своего Mac: `arm64` для Apple Silicon, `x64` для Intel. Требуется macOS 14 или новее. Вместо DMG можно скачать ZIP.
+2. Перенесите Netbridge в «Программы» и откройте. Сборки не нотарифицированы Apple.
+3. Нажмите «Включить» на карточке нужного сервиса. При первом запуске Netbridge
+   загрузит и проверит компоненты. Для Zapret macOS запросит пароль администратора;
+   для Telegram нажмите «Подключить» и подтвердите прокси в мессенджере.
+
+### Что есть в приложении
+
+- **Обзор:** состояние обоих сервисов, управление ими и отчёт автоподбора Zapret.
+- **Диагностика:** HTTPS-проверки без перезапуска, история событий и экспорт JSON
+  без ключей, ссылок и локальных путей. Тесты не подтверждают воспроизведение видео
+  или доставку сообщений. После сна или смены маршрута результат помечается устаревшим.
+- **Строка меню:** значок Netbridge, быстрые команды и диагностика при закрытом окне.
+- **Офлайн-импорт:** кнопка с папкой принимает официальные архивы закреплённых версий,
+  проверяя SHA-256 и подпись. Импорт не запускает сервис.
+
+![Главное окно Netbridge с карточками YouTube и Telegram](docs/screenshots/overview.png)
+
+![Экран диагностики Netbridge](docs/screenshots/diagnostics.png)
+
+<details>
+<summary>Техническая документация и сборка (English)</summary>
 
 The supplied Netbridge artwork is used as a transparent sidebar logo and the macOS
 application icon. The logo's hover animation respects Reduce Motion. To recreate
@@ -18,13 +44,17 @@ run `python3 scripts/prepare-logo.py /absolute/path/to/source.jpeg`.
 3. YouTube asks for macOS administrator approval to install/manage the upstream
    system service and PF rules. Keep the original ZapretMac app closed while using
    Netbridge. First-time strategy selection can take several minutes.
-4. Telegram generates a private localhost config and opens its `tg://proxy` link.
-   Confirm the connection in Telegram. Its tray app may show upstream first-run
+4. Telegram generates a private localhost config. Click **Connect** to open the
+   proxy link and confirm the connection in Telegram. Failure to open Telegram
+   does not stop the local proxy. Its tray app may show upstream first-run
    notices. The dashboard checks the listener's process identity, not Telegram delivery.
 
 Internet access to GitHub and release asset hosts is required for the first download.
-If these are blocked, the app reports the error; it cannot bootstrap offline.
-Verified installed components are reused. macOS Gatekeeper/authorization dialogs
+If these are blocked, use the folder icon on the stopped service to import the
+exact ZIP or DMG from the pinned releases below. Import performs the same checks
+as download and does not start the service. Verified installed components are reused.
+Stopping Zapret uses its installed system script and does not download components.
+macOS Gatekeeper/authorization dialogs
 are not disabled or bypassed. Ad-hoc signatures are integrity checks, not Apple
 notarization or proof of publisher identity; pinned archive hashes are checked too.
 
@@ -91,6 +121,8 @@ then disable/re-enable Zapret. Do not run upstream strategy tests concurrently.
 - Zapret system files: `/Library/Application Support/ZapretMac/`; LaunchDaemon:
   `/Library/LaunchDaemons/io.github.flowseal.zapretmac.plist`.
 - Network profiles: `profiles.json` in app data. Theme settings: renderer local storage.
+- The last strategy attempt and last successful report are stored separately in
+  `strategy-report.json`; the latest 100 app events are stored in `history.json`.
 
 Zapret uses Flowseal's system-wide service and PF configuration, not a per-browser
 proxy or an anonymity VPN. It can affect other traffic matched by upstream lists.
@@ -98,6 +130,17 @@ Closing Netbridge does not stop services. Disable them using their buttons befor
 exiting when they should not remain active; deleting Netbridge alone does not
 uninstall the upstream system service. Disable Telegram's proxy in Telegram when
 you stop its local service.
+
+## Diagnostics
+
+The menu bar item controls both services even when the main window is closed.
+**Check now**, in the menu bar or the Diagnostics page, runs three HTTPS checks
+as the current user without restarting a service or asking for administrator access.
+The page distinguishes service status, HTTPS reachability, video playback and
+message delivery. Only the first two are checked. Sleep/wake, a detected change
+to the default route, or a service change marks the result stale without taking action.
+The JSON history export contains timestamps, service names, actions and outcomes;
+it excludes raw logs, local paths, connection links, keys and network identifiers.
 
 ## Pinned Components
 
@@ -114,9 +157,10 @@ downloaded bundles. Refer to each repository's license for its own code and depe
 
 ## Development
 
-Requires Node.js 22.12+ and npm.
+Uses Node.js 24.13.1 and npm (pinned in `.nvmrc` and used in macOS CI).
 
 ```sh
+nvm use
 npm ci
 npm test
 npm run dev
@@ -129,3 +173,5 @@ Building supports `--arm64` or `--x64`; downloaded Flowseal components are unive
 Local packages are unsigned/not notarized. Developer ID distribution requires
 the owner's Apple Developer credentials. Successful build/unit tests alone do not
 establish that a strategy works on a particular censored network.
+
+</details>

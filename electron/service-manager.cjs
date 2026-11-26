@@ -11,6 +11,7 @@ const { PROFILE_REVISION, adaptZapretPayload } = require("./zapret-compat.cjs");
 
 const execute = promisify(execFile);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const zapretJob = "system/io.github.flowseal.zapretmac";
 const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 const appleString = (value) => `"${String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("\n", "\\n").replaceAll("\r", "\\r")}"`;
 
@@ -73,7 +74,7 @@ class ServiceManager extends EventEmitter {
     this.installer = deps.installer || new ComponentInstaller(path.join(root, "components"), (key, state) => this.update(key, state));
     this.busy = new Set();
     this.cancelRequested = false;
-    this.refreshing = false;
+    this.refreshing = null;
     this.process = null;
     this.state = {
       zapret: { phase: "idle", running: false, installed: false, message: "Выключен" },
@@ -88,28 +89,64 @@ class ServiceManager extends EventEmitter {
 
   snapshot() { return structuredClone(this.state); }
 
-  async exclusive(key, action) {
+  async exclusive(key, action, operation) {
     component(key);
     if (this.platform !== "darwin") throw new Error("Управление доступно только в приложении macOS");
     if (this.busy.has(key)) throw new Error("Операция уже выполняется");
     this.busy.add(key);
+    if (operation) this.emit("operation", { service: key, operation, outcome: "started" });
     this.update(key, { error: null, phase: "prepare", message: "Подготовка…" });
     try {
       await action();
       this.update(key, { phase: "idle", message: null });
+      if (operation) this.emit("operation", { service: key, operation, outcome: "ok" });
     } catch (error) {
       this.update(key, { phase: "error", error: error.message, message: null });
+      if (operation) this.emit("operation", { service: key, operation,
+        outcome: error.code === "NETBRIDGE_CANCELLED" ? "cancelled" : "failed" });
       throw error;
     } finally {
-      this.busy.delete(key);
-      await this.refresh();
-      this.update(key, {});
+      try {
+        if (this.refreshing) await this.refreshing;
+        await this.refresh();
+      } finally {
+        this.busy.delete(key);
+        this.update(key, {});
+      }
     }
+  }
+
+  async restoreStrategyReport() {
+    try {
+      const { report, attempt } = JSON.parse(await readText(path.join(this.root, "strategy-report.json"), "{}"));
+      if (typeof report?.strategy === "string" && typeof report.results === "string") this.state.zapret.report = report;
+      if (attempt && ["running", "ok", "cancelled", "failed", "interrupted"].includes(attempt.outcome)) {
+        this.state.zapret.attempt = attempt.outcome === "running" ? { ...attempt, outcome: "interrupted" } : attempt;
+      }
+    } catch { /* A damaged report does not block service management. */ }
+  }
+
+  async saveStrategyReport(values) {
+    this.update("zapret", values);
+    const { report, attempt } = this.state.zapret;
+    try {
+      await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
+      await atomicWrite(path.join(this.root, "strategy-report.json"), JSON.stringify({ report, attempt }));
+      this.update("zapret", { reportNotSaved: false });
+    } catch { this.update("zapret", { reportNotSaved: true }); }
+  }
+
+  async importComponent(key, filename) {
+    return this.exclusive(key, async () => {
+      const running = key === "zapret" ? await this.zapretLoaded() : await this.tgPID(await this.tgConfig());
+      if (running) throw new Error("Перед импортом выключите сервис");
+      await this.installer.import(key, filename);
+    }, "import");
   }
 
   async zapretRunning() {
     try {
-      const { stdout } = await this.run("/bin/launchctl", ["print", "system/io.github.flowseal.zapretmac"], { timeout: 3000 });
+      const { stdout } = await this.run("/bin/launchctl", ["print", zapretJob], { timeout: 3000 });
       if (!/state = running/.test(stdout)) return false;
       await this.run("/usr/bin/pgrep", ["-x", "utunws"], { timeout: 3000 });
       await this.run("/sbin/ifconfig", ["utun50"], { timeout: 3000 });
@@ -138,23 +175,22 @@ class ServiceManager extends EventEmitter {
   }
 
   async refresh() {
-    if (this.refreshing) return;
-    this.refreshing = true;
-    try {
-      await Promise.all(["zapret", "telegram"].map(async (key) => {
-        try {
-          const installed = await this.installer.installed(key);
-          if (key === "zapret") {
-            this.update(key, { installed, running: await this.zapretRunning(),
-              strategy: await readText(path.join(this.zapretData, "selected-strategy")) });
-          } else {
-            const config = await this.tgConfig();
-            this.update(key, { installed, running: Boolean(await this.tgPID(config)),
-              address: config ? `127.0.0.1:${config.port}` : null });
-          }
-        } catch (error) { this.update(key, { running: false, error: error.message }); }
-      }));
-    } finally { this.refreshing = false; }
+    if (this.refreshing) return this.refreshing;
+    this.refreshing = Promise.all(["zapret", "telegram"].map(async (key) => {
+      try {
+        const installed = await this.installer.installed(key);
+        if (key === "zapret") {
+          const running = await this.zapretRunning();
+          this.update(key, { installed, running, loaded: running || await this.zapretLoaded() });
+          this.update(key, { strategy: await readText(path.join(this.zapretData, "selected-strategy")) });
+        } else {
+          const config = await this.tgConfig();
+          this.update(key, { installed, running: Boolean(await this.tgPID(config)),
+            address: config ? `127.0.0.1:${config.port}` : null });
+        }
+      } catch (error) { this.update(key, { error: error.message }); }
+    })).finally(() => { this.refreshing = null; });
+    return this.refreshing;
   }
 
   async prepareZapret(bundle) {
@@ -221,7 +257,10 @@ class ServiceManager extends EventEmitter {
   }
 
   async privileged(payload, mode, preferred = "") {
-    const work = path.join(this.zapretData, "netbridge-test");
+    const work = path.join(this.zapretData, mode === "stop" ? "netbridge-stop" : "netbridge-test");
+    await ensurePlain(this.zapretData, true);
+    await ensurePlain(work, true);
+    await fs.mkdir(work, { recursive: true, mode: 0o700 });
     for (const name of ["cancel", "best", "progress", "results.tsv", "cached", "outcome", "failure"]) {
       await fs.rm(path.join(work, name), { force: true });
     }
@@ -230,15 +269,17 @@ class ServiceManager extends EventEmitter {
     let timer;
     let finished = false;
     try {
-      const source = path.join(stage, "Payload");
-      await fs.cp(payload, source, { recursive: true });
-      // Never edit the verified upstream bundle; adapt only the private staging copy.
-      if (mode === "optimize") await adaptZapretPayload(source);
+      const source = mode === "stop" ? "" : path.join(stage, "Payload");
+      if (source) {
+        await fs.cp(payload, source, { recursive: true });
+        // Never edit the verified upstream bundle; adapt only the private staging copy.
+        await adaptZapretPayload(source);
+      }
       const runner = path.join(stage, "runner.sh");
       await fs.copyFile(path.join(__dirname, "zapret-runner.sh"), runner);
       const args = ["/bin/sh", runner, source, this.zapretData, process.getuid(), process.getgid(), mode, preferred];
       const command = args.map(shellQuote).join(" ");
-      if (this.cancelRequested && mode !== "stop") throw new Error("Операция отменена до запуска сервиса");
+      if (this.cancelRequested && mode !== "stop") throw cancelledError("Операция отменена до запуска сервиса");
       this.update("zapret", { phase: mode === "optimize" ? "optimize" : "authorize",
         cancellable: mode !== "stop", message: "Ожидание подтверждения macOS…" });
       timer = setInterval(async () => {
@@ -260,8 +301,9 @@ class ServiceManager extends EventEmitter {
       ], { maxBuffer: 2 * 1024 * 1024 });
       return await readText(path.join(work, "best"));
     } catch (error) {
+      if (error.code === "NETBRIDGE_CANCELLED") throw error;
       if (await readText(path.join(work, "outcome")) === "cancelled") {
-        throw new Error("Операция отменена. Прежние настройки восстановлены.");
+        throw cancelledError("Операция отменена. Прежние настройки восстановлены.");
       }
       const progress = await readText(path.join(work, "progress"));
       const failure = await readText(path.join(work, "failure"));
@@ -282,45 +324,78 @@ class ServiceManager extends EventEmitter {
   async enableZapret(forceOptimize = false) {
     return this.exclusive("zapret", async () => {
       this.cancelRequested = false;
-      await this.checkZapretNetwork();
-      const bundle = await this.installer.ensure("zapret");
-      const payload = await this.prepareZapret(bundle);
-      const network = await this.networkKey();
-      const profilesFile = path.join(this.root, "profiles.json");
-      let profiles;
-      try { profiles = JSON.parse(await readText(profilesFile, "{}")); }
-      catch { profiles = {}; }
-      if (!profiles || Array.isArray(profiles) || typeof profiles !== "object") profiles = {};
-      const cached = network ? profiles[network] : undefined;
-      const strategies = (await fs.readFile(path.join(payload, "strategies.tsv"), "utf8")).split(/\r?\n/).map((line) => line.split("\t")[0]);
-      if (this.cancelRequested) throw new Error("Операция отменена до запуска сервиса");
-      const preferred = !forceOptimize && cached && strategies.includes(cached.strategy) ? cached.strategy : "";
-      const best = await this.privileged(payload, "optimize", preferred);
-      if (!strategies.includes(best)) throw new Error("Подбор не вернул допустимую стратегию");
-      if (await readText(path.join(this.zapretData, "netbridge-test/cached")) === "yes") {
-        this.update("zapret", { report: { ...cached, cached: true } });
-        return;
+      const attempt = { startedAt: new Date().toISOString(), outcome: "running" };
+      await this.saveStrategyReport({ attempt });
+      try {
+        const report = await this.selectStrategy(forceOptimize);
+        await this.saveStrategyReport({ report,
+          attempt: { ...attempt, finishedAt: report.verifiedAt, outcome: "ok" } });
+      } catch (error) {
+        await this.saveStrategyReport({ attempt: { ...attempt, finishedAt: new Date().toISOString(),
+          outcome: error.code === "NETBRIDGE_CANCELLED" ? "cancelled" : "failed" } });
+        throw error;
       }
-      const report = {
-        strategy: best, testedAt: new Date().toISOString(), cached: false,
-        configRevision: PROFILE_REVISION,
-        results: await readText(path.join(this.zapretData, "netbridge-test/results.tsv")),
-      };
-      if (network) {
-        profiles[network] = report;
-        await atomicWrite(profilesFile, JSON.stringify(profiles, null, 2));
-      }
-      this.update("zapret", { report });
-    });
+    }, forceOptimize ? "optimize" : "start");
+  }
+
+  async selectStrategy(forceOptimize) {
+    await this.checkZapretNetwork();
+    const bundle = await this.installer.ensure("zapret");
+    const payload = await this.prepareZapret(bundle);
+    const network = await this.networkKey();
+    const profilesFile = path.join(this.root, "profiles.json");
+    let profiles;
+    try { profiles = JSON.parse(await readText(profilesFile, "{}")); }
+    catch { profiles = {}; }
+    if (!profiles || Array.isArray(profiles) || typeof profiles !== "object") profiles = {};
+    const cached = network ? profiles[network] : undefined;
+    const strategies = (await fs.readFile(path.join(payload, "strategies.tsv"), "utf8"))
+      .split(/\r?\n/).map((line) => line.split("\t")[0]).filter(Boolean);
+    if (this.cancelRequested) throw cancelledError("Операция отменена до запуска сервиса");
+    const preferred = !forceOptimize && cached && strategies.includes(cached.strategy) ? cached.strategy : "";
+    const best = await this.privileged(payload, "optimize", preferred);
+    if (!strategies.includes(best)) throw new Error("Подбор не вернул допустимую стратегию");
+    const verifiedAt = new Date().toISOString();
+    if (best === preferred && await readText(path.join(this.zapretData, "netbridge-test/cached")) === "yes") {
+      return { ...cached, strategy: best, verifiedAt, cached: true,
+        results: typeof cached.results === "string" ? cached.results : "" };
+    }
+    const report = {
+      strategy: best, testedAt: verifiedAt, verifiedAt, cached: false,
+      configRevision: PROFILE_REVISION,
+      results: await readText(path.join(this.zapretData, "netbridge-test/results.tsv")),
+    };
+    if (network) {
+      profiles[network] = report;
+      // Failure to save a cache must not turn a committed operation into a failure.
+      await atomicWrite(profilesFile, JSON.stringify(profiles, null, 2)).catch(() => {});
+    }
+    return report;
   }
 
   async stopZapret() {
     return this.exclusive("zapret", async () => {
-      const bundle = await this.installer.ensure("zapret");
-      const payload = await this.prepareZapret(bundle);
-      await this.privileged(payload, "stop");
-      if (await this.zapretRunning()) throw new Error("Сервис не остановился");
-    });
+      await this.privileged(null, "stop");
+      this.update("zapret", { phase: "finishing", message: "Ожидание остановки Zapret…" });
+      // launchd can retain a job while its process is exiting after bootout.
+      for (let attempt = 0; attempt <= 20; attempt += 1) {
+        if (!await this.zapretLoaded({ requireAnswer: true })) return;
+        if (attempt < 20) await sleep(250);
+      }
+      throw new Error("macOS всё ещё показывает Zapret в списке служб. Попробуйте выключить его ещё раз.");
+    }, "stop");
+  }
+
+  async zapretLoaded({ requireAnswer = false } = {}) {
+    try {
+      await this.run("/bin/launchctl", ["print", zapretJob], { timeout: 3000 });
+      return true;
+    } catch (error) {
+      if (requireAnswer && error.code !== 113) {
+        throw new Error("Не удалось проверить, остановился ли Zapret: macOS не вернула состояние службы.");
+      }
+      return false;
+    }
   }
 
   async cancel() {
@@ -368,7 +443,7 @@ class ServiceManager extends EventEmitter {
       }
       child.kill("SIGTERM");
       throw new Error("Прокси не начал слушать порт за 60 секунд. Проверьте запросы macOS.");
-    });
+    }, "start");
   }
 
   async stopTelegram() {
@@ -382,7 +457,7 @@ class ServiceManager extends EventEmitter {
         await sleep(200);
       }
       throw new Error("Прокси не завершился. Закройте TG WS Proxy из его меню.");
-    });
+    }, "stop");
   }
 
   async telegramLink() {
@@ -390,6 +465,10 @@ class ServiceManager extends EventEmitter {
     if (!await this.tgPID(config)) throw new Error("Сначала включите Telegram-прокси");
     return proxyLink(config);
   }
+}
+
+function cancelledError(message) {
+  return Object.assign(new Error(message), { code: "NETBRIDGE_CANCELLED" });
 }
 
 module.exports = { ServiceManager, shellQuote, appleString, validConfig, proxyLink, atomicWrite };

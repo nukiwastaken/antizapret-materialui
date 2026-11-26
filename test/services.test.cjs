@@ -62,6 +62,67 @@ test("digest mismatch aborts before extraction", async (t) => {
   assert.equal(await digest(sample), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 });
 
+test("offline import rejects wrong formats and refuses to extract bad hashes", async (t) => {
+  const root = await temporary(t);
+  const installer = new ComponentInstaller(path.join(root, "components"), () => {}, async () => {
+    assert.fail("a bad archive must not call curl, unzip, hdiutil or codesign");
+  });
+  for (const [key, name] of [["zapret", "local.ZIP"], ["telegram", "local.dmg"]]) {
+    const archive = path.join(root, name);
+    await fs.writeFile(archive, "tampered");
+    await assert.rejects(installer.import(key, `${archive}.txt`), /формата/);
+    await assert.rejects(installer.import(key, archive), /SHA-256/);
+    assert.equal(await fs.readFile(archive, "utf8"), "tampered");
+    assert.equal(await installer.installed(key), false);
+  }
+  assert.deepEqual(await fs.readdir(installer.root), []);
+});
+
+test("offline stop does not ensure, download, or prepare the Zapret bundle", async (t) => {
+  const m = manager(await temporary(t));
+  m.installer.ensure = async () => assert.fail("must not use the installer");
+  m.prepareZapret = async () => assert.fail("must not require strategy files");
+  let calls = 0;
+  m.privileged = async (payload, mode) => {
+    calls++;
+    assert.equal(payload, null);
+    assert.equal(mode, "stop");
+  };
+  m.zapretLoaded = async () => false;
+  await m.stopZapret();
+  assert.equal(calls, 1);
+});
+
+test("Zapret stop waits for launchd to remove the job", async (t) => {
+  let checks = 0;
+  const m = manager(await temporary(t), { run: async (exe, args) => {
+    assert.equal(exe, "/bin/launchctl");
+    assert.deepEqual(args, ["print", "system/io.github.flowseal.zapretmac"]);
+    if (++checks <= 2) return { stdout: "state = exiting" };
+    throw Object.assign(new Error("Could not find service"), { code: 113 });
+  } });
+  m.refresh = async () => {};
+  m.privileged = async () => {};
+  await m.stopZapret();
+  assert.equal(checks, 3);
+});
+
+test("Zapret stop does not confuse a launchctl error with a missing job", async (t) => {
+  const m = manager(await temporary(t), { run: async () => { throw new Error("launchctl timed out"); } });
+  m.privileged = async () => {};
+  await assert.rejects(m.stopZapret(), /Не удалось проверить/);
+});
+
+test("import is not allowed while the destination service is active", async (t) => {
+  const m = manager(await temporary(t));
+  m.installer.import = async () => assert.fail("must not replace an active component");
+  m.zapretLoaded = async () => true;
+  m.tgPID = async () => 321;
+  for (const key of ["zapret", "telegram"]) {
+    await assert.rejects(m.importComponent(key, "/archive"), /выключите сервис/);
+  }
+});
+
 test("operation exclusion resets busy after success and errors", async (t) => {
   const m = manager(await temporary(t));
   let release;
@@ -170,7 +231,8 @@ for (const route of [
     m.privileged = async () => assert.fail("must not request authorization");
     await assert.rejects(m.enableZapret(true), /туннель|маршрут не подходит/);
     assert.equal(m.busy.size, 0);
-    assert.deepEqual(await fs.readdir(root), []);
+    assert.deepEqual(await fs.readdir(root), ["strategy-report.json"]);
+    assert.equal(m.state.zapret.attempt.outcome, "failed");
   });
 }
 
@@ -205,12 +267,18 @@ test("cache selection is passed into the privileged transaction without pre-writ
   await m.enableZapret();
   assert.equal(m.state.zapret.report.cached, true);
   assert.equal(m.state.zapret.report.results, "old");
+  const priorReport = m.state.zapret.report;
+  assert.ok(Number.isFinite(Date.parse(priorReport.verifiedAt)));
   m.privileged = async (_payload, _mode, preferred) => {
     assert.equal(preferred, "");
     throw new Error("cancelled");
   };
   await assert.rejects(m.enableZapret(true), /cancelled/);
   assert.equal(m.busy.size, 0);
+  const restored = manager(root);
+  await restored.restoreStrategyReport();
+  assert.deepEqual(restored.state.zapret.report, priorReport);
+  assert.equal(restored.state.zapret.attempt.outcome, "failed");
   m.networkKey = async () => null;
   const oldProfiles = await fs.readFile(path.join(root, "profiles.json"), "utf8");
   m.privileged = async (_payload, _mode, preferred) => {
@@ -271,6 +339,7 @@ async function runnerFixture(t, behavior = "success") {
   const work = path.join(data, "netbridge-test");
   const bin = path.join(root, "bin");
   await fs.mkdir(work, { recursive: true });
+  await fs.mkdir(path.join(data, "netbridge-stop"));
   await fs.mkdir(bin);
   await fs.mkdir(path.join(source, "strategies"), { recursive: true });
   await fs.writeFile(path.join(data, "selected-strategy"), "general-original\n");
@@ -279,15 +348,16 @@ async function runnerFixture(t, behavior = "success") {
   for (const strategy of ["general-slow", "general-fast"]) await fs.writeFile(path.join(source, "strategies", `${strategy}.conf.in`), "");
   const state = path.join(root, "running");
   const code = {
-    sudo: '#!/bin/sh\nshift; shift; shift\nexec "$@"\n',
+    sudo: '#!/bin/sh\n[ "$1" != -n ] || shift\nshift; shift; shift\nexec "$@"\n',
     launchctl: `#!/bin/sh\n[ -f ${shellQuote(state)} ]\n`,
     pgrep: `#!/bin/sh\nif [ "$1" = -P ]; then exec /usr/bin/pgrep "$@"; fi\n[ "$2" != ZapretMac ] && /bin/cat ${shellQuote(state)}\n`,
     ifconfig: `#!/bin/sh\n[ -f ${shellQuote(state)} ]\n`,
     pfctl: '#!/bin/sh\nprintf "route-to\\n"\n',
+    stat: '#!/bin/sh\nprintf "0 755\\n"\n',
     route: '#!/bin/sh\nprintf "gateway: 192.168.1.1\\ninterface: en1\\n"\n',
     curl: `#!/bin/sh
 strategy=$(/bin/cat ${shellQuote(path.join(data, "selected-strategy"))})
-${behavior === "slow" ? `printf '%s\\n' "$$" >> ${shellQuote(path.join(work, "probe-pids"))}\n/bin/sleep 60` : ""}
+${behavior === "slow" ? `printf '%s\\n' "$$" >> ${shellQuote(path.join(work, "probe-pids"))}\nexec /bin/sleep 60` : ""}
 ${behavior === "cancel" ? `/usr/bin/touch ${shellQuote(path.join(work, "cancel"))}` : ""}
 case "$strategy" in general-fast) time=0.1;; *) time=1;; esac
 case "$*" in *generate_204*) code=204;; *) code=200;; esac
@@ -308,17 +378,33 @@ printf '%s\\t%s' "$code" "$time"
   for (const [exe, name] of [
     ["/usr/bin/sudo", "sudo"], ["/bin/launchctl", "launchctl"], ["/usr/bin/pgrep", "pgrep"],
     ["/sbin/ifconfig", "ifconfig"], ["/sbin/pfctl", "pfctl"], ["/usr/bin/curl", "curl"],
-    ["/sbin/route", "route"],
+    ["/sbin/route", "route"], ["/usr/bin/stat", "stat"],
   ]) script = script.replaceAll(exe, shellQuote(path.join(bin, name)));
   const file = path.join(root, "runner.sh");
   await fs.writeFile(file, script);
   const args = [file, source, data, "501", "20", "optimize"];
   return { root, data, work, state, source,
     run: (preferred = "") => run("/bin/sh", [...args, preferred], { timeout: 15000 }),
+    stop: () => run("/bin/sh", [file, path.join(root, "missing"), data, "501", "20", "stop"], { timeout: 3000 }),
     appleRun: () => run("/usr/bin/osascript", ["-e",
       `do shell script ${appleString(["/bin/sh", ...args].map(shellQuote).join(" "))}`], { timeout: 10000 }),
   };
 }
+
+test("runner stops using its local system script, without a staged payload", async (t) => {
+  const f = await runnerFixture(t);
+  await fs.writeFile(f.state, "100\n");
+  await f.stop();
+  await assert.rejects(fs.access(f.state), { code: "ENOENT" });
+});
+
+test("runner refuses a writable installed stop script", async (t) => {
+  const f = await runnerFixture(t);
+  await fs.writeFile(f.state, "100\n");
+  await fs.writeFile(path.join(f.root, "bin/stat"), '#!/bin/sh\ncase "$3" in */stop.sh) echo "0 775";; *) echo "0 755";; esac\n');
+  await assert.rejects(f.stop(), { code: 8 });
+  assert.equal(await fs.readFile(f.state, "utf8"), "100\n");
+});
 
 async function waitForFile(file) {
   for (let i = 0; i < 150; i += 1) {
