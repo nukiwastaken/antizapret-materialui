@@ -5,8 +5,10 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
+const { createHash } = require("node:crypto");
 const { component, validateArchiveEntries, digest, ComponentInstaller } = require("../electron/components.cjs");
 const { ServiceManager, shellQuote, appleString, validConfig, proxyLink } = require("../electron/service-manager.cjs");
+const { PROFILE_REVISION } = require("../electron/zapret-compat.cjs");
 const run = promisify(execFile);
 
 async function temporary(t) {
@@ -92,6 +94,92 @@ test("a foreign process on the proxy port is never treated as ours", async (t) =
   assert.equal(await m.tgPID({ port: 1443 }), 321);
 });
 
+test("ordinary gateway routes scope the cache to the adapted config revision", async (t) => {
+  const m = manager(await temporary(t), {
+    run: async (exe, args, options) => {
+      assert.equal(exe, "/sbin/route");
+      assert.deepEqual(args, ["-n", "get", "default"]);
+      assert.equal(options.timeout, 3000);
+      return { stdout: "    gateway: 192.168.1.1\n  interface: en1\n" };
+    },
+  });
+  const expected = createHash("sha256").update(`192.168.1.1|en1|${component("zapret").version}|${PROFILE_REVISION}`).digest("hex");
+  assert.equal(await m.networkKey(), expected);
+  const legacy = createHash("sha256").update(`192.168.1.1|en1|${component("zapret").version}`).digest("hex");
+  assert.notEqual(expected, legacy);
+});
+
+test("active gatewayless tunnel routes are accepted without an unsafe cache identity", async (t) => {
+  const m = manager(await temporary(t), {
+    run: async () => ({ stdout: "destination: default\n  interface: utun4\n flags: <UP,DONE>\n" }),
+  });
+  assert.equal(await m.networkKey(), null);
+  m.run = async () => ({ stdout: "gateway: \ninterface: utun4\n" });
+  assert.equal(await m.networkKey(), null);
+});
+
+for (const ipv4 of ["unavailable", "missing interface", "loopback"]) {
+  test(`IPv6 default route is used when IPv4 is ${ipv4}`, async (t) => {
+    let calls = 0;
+    const m = manager(await temporary(t), {
+      run: async (_exe, args, options) => {
+        calls++;
+        assert.equal(options.timeout, 3000);
+        if (!args.includes("-inet6")) {
+          if (ipv4 === "unavailable") throw new Error("route timeout");
+          return { stdout: ipv4 === "loopback" ? "interface: lo0\n" : "destination: default\n" };
+        }
+        return { stdout: "gateway: fe80::1%en1\ninterface: en1\n" };
+      },
+    });
+    assert.match(await m.networkKey(), /^[a-f0-9]{64}$/);
+    assert.equal(calls, 2);
+  });
+}
+
+test("missing IPv4 and IPv6 routes produce an actionable error", async (t) => {
+  let calls = 0;
+  const m = manager(await temporary(t), {
+    run: async () => { calls++; throw new Error("not in table"); },
+  });
+  await assert.rejects(m.networkKey(), /Проверьте подключение/);
+  assert.equal(calls, 2);
+});
+
+test("Zapret preflight accepts an ordinary IPv4 gateway", async (t) => {
+  const m = manager(await temporary(t), {
+    run: async (_exe, _args, options) => {
+      assert.equal(options.timeout, 3000);
+      return { stdout: "gateway: 192.168.1.1\ninterface: en1\n" };
+    },
+  });
+  await m.checkZapretNetwork();
+});
+
+for (const route of [
+  "interface: utun4\n",
+  "gateway: 10.0.0.1\ninterface: utun7\n",
+  "interface: en1\n",
+  "gateway: fe80::1\ninterface: en1\n",
+]) {
+  test(`unsupported route is rejected before download, config writes or authorization: ${route.trim()}`, async (t) => {
+    const root = await temporary(t);
+    const m = manager(root, { run: async () => ({ stdout: route }) });
+    m.installer.ensure = async () => assert.fail("must not download");
+    m.prepareZapret = async () => assert.fail("must not change config");
+    m.privileged = async () => assert.fail("must not request authorization");
+    await assert.rejects(m.enableZapret(true), /туннель|маршрут не подходит/);
+    assert.equal(m.busy.size, 0);
+    assert.deepEqual(await fs.readdir(root), []);
+  });
+}
+
+test("Zapret preflight reports unavailable IPv4 routes without authorization", async (t) => {
+  const m = manager(await temporary(t));
+  await assert.rejects(m.enableZapret(), /требует подключения IPv4/);
+  assert.equal(m.busy.size, 0);
+});
+
 test("cache selection is passed into the privileged transaction without pre-writing config", async (t) => {
   const root = await temporary(t);
   const m = manager(root);
@@ -102,6 +190,7 @@ test("cache selection is passed into the privileged transaction without pre-writ
   m.installer.ensure = async () => payload;
   m.prepareZapret = async () => payload;
   m.networkKey = async () => "network";
+  m.checkZapretNetwork = async () => {};
   const work = path.join(m.zapretData, "netbridge-test");
   await fs.mkdir(work, { recursive: true });
   const selected = path.join(m.zapretData, "selected-strategy");
@@ -122,6 +211,17 @@ test("cache selection is passed into the privileged transaction without pre-writ
   };
   await assert.rejects(m.enableZapret(true), /cancelled/);
   assert.equal(m.busy.size, 0);
+  m.networkKey = async () => null;
+  const oldProfiles = await fs.readFile(path.join(root, "profiles.json"), "utf8");
+  m.privileged = async (_payload, _mode, preferred) => {
+    assert.equal(preferred, "");
+    await fs.rm(path.join(work, "cached"), { force: true });
+    return "general";
+  };
+  await m.enableZapret();
+  assert.equal(m.state.zapret.report.strategy, "general");
+  assert.equal(m.state.zapret.report.cached, false);
+  assert.equal(await fs.readFile(path.join(root, "profiles.json"), "utf8"), oldProfiles);
 });
 
 test("cancellation never follows a work directory symlink", async (t) => {
@@ -138,6 +238,32 @@ test("cancellation never follows a work directory symlink", async (t) => {
 });
 
 // Replace OS commands only in a temporary COPY of the runner. No root or network changes.
+async function stagedPayload(payload) {
+  await fs.mkdir(path.join(payload, "strategies"), { recursive: true });
+  await fs.writeFile(path.join(payload, "strategies.tsv"), "general\tGeneral\n");
+  await fs.writeFile(path.join(payload, "strategies/general.conf.in"),
+    '--filter-udp=443\n--hostlist="@LISTS@/list-general.txt"\n--dpi-desync-fake-quic="@BASE@/bin/quic.bin"\n');
+}
+
+test("only the staging payload is adapted before requesting administrator approval", async (t) => {
+  const root = await temporary(t);
+  const payload = path.join(root, "payload");
+  await stagedPayload(payload);
+  const original = await fs.readFile(path.join(payload, "strategies/general.conf.in"), "utf8");
+  let staged;
+  const m = manager(root, { run: async (_exe, args) => {
+    staged = args.join(" ").match(/'([^']+\/Payload)'/)?.[1];
+    assert.ok(staged);
+    const adapted = await fs.readFile(path.join(staged, "strategies/general.conf.in"), "utf8");
+    assert.match(adapted, /list-google\.txt/);
+    assert.equal(await fs.readFile(path.join(payload, "strategies/general.conf.in"), "utf8"), original);
+    return { stdout: "" };
+  } });
+  await fs.mkdir(path.join(m.zapretData, "netbridge-test"), { recursive: true });
+  await m.privileged(payload, "optimize");
+  await assert.rejects(fs.access(staged), { code: "ENOENT" });
+});
+
 async function runnerFixture(t, behavior = "success") {
   const root = await temporary(t);
   const data = path.join(root, "homes/test/Library/Application Support/ZapretMac");
@@ -158,6 +284,7 @@ async function runnerFixture(t, behavior = "success") {
     pgrep: `#!/bin/sh\nif [ "$1" = -P ]; then exec /usr/bin/pgrep "$@"; fi\n[ "$2" != ZapretMac ] && /bin/cat ${shellQuote(state)}\n`,
     ifconfig: `#!/bin/sh\n[ -f ${shellQuote(state)} ]\n`,
     pfctl: '#!/bin/sh\nprintf "route-to\\n"\n',
+    route: '#!/bin/sh\nprintf "gateway: 192.168.1.1\\ninterface: en1\\n"\n',
     curl: `#!/bin/sh
 strategy=$(/bin/cat ${shellQuote(path.join(data, "selected-strategy"))})
 ${behavior === "slow" ? `printf '%s\\n' "$$" >> ${shellQuote(path.join(work, "probe-pids"))}\n/bin/sleep 60` : ""}
@@ -181,6 +308,7 @@ printf '%s\\t%s' "$code" "$time"
   for (const [exe, name] of [
     ["/usr/bin/sudo", "sudo"], ["/bin/launchctl", "launchctl"], ["/usr/bin/pgrep", "pgrep"],
     ["/sbin/ifconfig", "ifconfig"], ["/sbin/pfctl", "pfctl"], ["/usr/bin/curl", "curl"],
+    ["/sbin/route", "route"],
   ]) script = script.replaceAll(exe, shellQuote(path.join(bin, name)));
   const file = path.join(root, "runner.sh");
   await fs.writeFile(file, script);
@@ -210,7 +338,7 @@ test("cancel stays non-repeatable and stale progress cannot hide restoration", a
   }) });
   const payload = path.join(root, "payload");
   const work = path.join(m.zapretData, "netbridge-test");
-  await fs.mkdir(payload);
+  await stagedPayload(payload);
   await fs.mkdir(work, { recursive: true });
   m.busy.add("zapret");
   const result = assert.rejects(m.privileged(payload, "optimize"), /Прежние настройки восстановлены/);
@@ -234,7 +362,7 @@ test("committed progress disables cancel until the real process returns", async 
   const m = manager(root, { run: () => new Promise((resolve) => { finish = resolve; }) });
   const payload = path.join(root, "payload");
   const work = path.join(m.zapretData, "netbridge-test");
-  await fs.mkdir(payload);
+  await stagedPayload(payload);
   await fs.mkdir(work, { recursive: true });
   m.busy.add("zapret");
   const result = m.privileged(payload, "optimize");
@@ -249,6 +377,48 @@ test("committed progress disables cancel until the real process returns", async 
   await assert.rejects(fs.access(path.join(work, "cancel")));
   finish({ stdout: "" });
   assert.equal(await result, "general-fast");
+});
+
+test("upstream installation error survives successful rollback", async (t) => {
+  const f = await runnerFixture(t);
+  await fs.writeFile(path.join(f.source, "install.sh"), "#!/bin/sh\necho 'utunws did not stay running' >&2\nexit 1\n");
+  await assert.rejects(f.run(), { code: 1 });
+  assert.match(await fs.readFile(path.join(f.work, "failure"), "utf8"), /utunws did not stay running/);
+  assert.equal((await fs.readFile(path.join(f.data, "selected-strategy"), "utf8")).trim(), "general-original");
+  await assert.rejects(fs.access(f.state));
+  await assert.rejects(fs.access(path.join(f.root, "lock")));
+});
+
+test("tunnel enabled during authorization is rejected without stopping an existing service", async (t) => {
+  const f = await runnerFixture(t);
+  await fs.writeFile(f.state, "100\n");
+  await fs.writeFile(path.join(f.root, "bin/route"), "#!/bin/sh\nprintf 'interface: utun4\\n'\n");
+  await assert.rejects(f.run(), { code: 7 });
+  assert.equal(await fs.readFile(f.state, "utf8"), "100\n");
+  assert.equal(await fs.readFile(path.join(f.data, "selected-strategy"), "utf8"), "general-original\n");
+  assert.match(await fs.readFile(path.join(f.work, "progress"), "utf8"), /Отключите VPN/);
+  await assert.rejects(fs.access(path.join(f.root, "lock")));
+});
+
+test("service error shows the original failure instead of rollback progress", async (t) => {
+  const root = await temporary(t);
+  let work;
+  const m = manager(root, { run: async () => {
+    await fs.writeFile(path.join(work, "failure"), "Не удалось запустить ZapretMac: fixture error");
+    await fs.writeFile(path.join(work, "progress"), "Восстановление прежних настроек");
+    throw new Error("osascript exit 1");
+  } });
+  const payload = path.join(root, "payload");
+  work = path.join(m.zapretData, "netbridge-test");
+  await stagedPayload(payload);
+  await fs.mkdir(work, { recursive: true });
+  await fs.writeFile(path.join(work, "failure"), "STALE");
+  await assert.rejects(m.privileged(payload, "optimize"), (error) => {
+    assert.match(error.message, /fixture error/);
+    assert.match(error.message, /Прежние настройки восстановлены/);
+    assert.doesNotMatch(error.message, /STALE/);
+    return true;
+  });
 });
 
 test("slow probes are interrupted on cancel and rollback completes promptly", async (t) => {

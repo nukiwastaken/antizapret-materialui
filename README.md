@@ -1,8 +1,13 @@
-# Netbridge for macOS 1.1.1
+# Netbridge for macOS 1.1.5
 
 Material UI dashboard for Flowseal's ZapretMac (YouTube) and TG WS Proxy
 (Telegram), with light/dark themes, accent colors, density and corner settings.
 Requires macOS 14 or newer. This is an independent integration, not a Flowseal release.
+
+The supplied Netbridge artwork is used as a transparent sidebar logo and the macOS
+application icon. The logo's hover animation respects Reduce Motion. To recreate
+the assets from the original white-background image on macOS, install Pillow and
+run `python3 scripts/prepare-logo.py /absolute/path/to/source.jpeg`.
 
 ## First Launch
 
@@ -25,6 +30,23 @@ notarization or proof of publisher identity; pinned archive hashes are checked t
 
 ## YouTube Autoconfiguration
 
+The pinned ZapretMac engine requires an IPv4 default route through a non-tunnel
+interface with a gateway and its ARP MAC address. It does not work with the current
+full-tunnel VPN route. Turn off VPN/tunnel mode in the other application before
+starting YouTube autoconfiguration. Netbridge checks for incompatible default
+routes before downloads, configuration writes or administrator authorization,
+and checks again after authorization before changing the service.
+It does not disable VPNs or reroute traffic around them automatically.
+IPv6-only connectivity is not supported by this engine integration.
+
+Before installation, Netbridge adapts a private staging copy of each pinned strategy:
+the first QUIC profile also includes `list-google.txt`, matching the existing
+Google/YouTube TCP profile. Upstream's initial QUIC hostlist otherwise omits these
+domains, and the later IPSet-only UDP profile does not cover them in `none` mode.
+Exclusions, desync settings and TCP profiles are preserved; the signed component
+bundle and user lists are not edited. The cache key includes the adaptation revision
+to prevent reusing results from the old rules.
+
 On first enable, Netbridge iterates the strategies shipped by ZapretMac. For each,
 it restarts the engine, waits for a new process/interface/PF route, and performs two
 rounds of HTTPS requests to YouTube (`generate_204`), a thumbnail and Google's video
@@ -33,10 +55,15 @@ redirector. Probes run as the current user because upstream PF excludes root tra
 Candidates must pass both YouTube checks and at least four of six checks overall.
 Ranking favors successful checks, then aggregate request time. The winner is applied
 and checked again. These are reachability checks, **not playback or throughput tests**;
-QUIC, real CDN streams, IPv6 and provider-specific behavior may differ.
+the Google Video `report_mapping` response is not a media download. Browser QUIC,
+real CDN streams, IPv6 and provider-specific behavior may differ. Configuring the
+QUIC hostlist is not proof that QUIC playback succeeds.
 
 The successful profile is cached by default gateway, interface and pinned Zapret
-version. This is a network hint, not a unique provider identifier. On subsequent
+version. Active point-to-point routes without a gateway are accepted but skip
+profile caching because the interface alone does not identify a network.
+IPv6 default routes are checked if no usable IPv4 default route is found.
+This is a network hint, not a unique provider identifier. On subsequent
 enable the profile is rechecked; failure triggers a new search within the same
 authorization operation. The wand button forces a new search.
 

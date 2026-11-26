@@ -36,6 +36,7 @@ function createWindow() {
     minWidth: 760,
     minHeight: 620,
     backgroundColor: "#f4f6f8",
+    icon: path.join(__dirname, "../assets/netbridge-icon.png"),
     titleBarStyle: "hiddenInset",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -56,6 +57,7 @@ if (!app.requestSingleInstanceLock()) app.quit();
 else {
   app.on("second-instance", () => { if (win) { win.show(); win.focus(); } });
   app.whenReady().then(async () => {
+    app.dock?.setIcon(path.join(__dirname, "../assets/netbridge-icon.png"));
     manager = new ServiceManager(app.getPath("userData"));
     manager.on("state", (state) => {
       if (win && !win.isDestroyed()) win.webContents.send("services:state", state);

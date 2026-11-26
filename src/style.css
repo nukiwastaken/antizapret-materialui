@@ -3,7 +3,17 @@ body { margin: 0; }
 .shell { display: flex; min-height: 100vh; }
 .sidebar { width: 242px; flex: 0 0 242px; min-height: 100vh; border-right: 1px solid rgba(120,140,140,.17); padding: 34px 18px 20px; display: flex; flex-direction: column; }
 .brand { display: flex; align-items: center; gap: 11px; padding: 4px 8px 45px; }
-.brand-mark { width: 36px!important; height: 36px!important; background: #267b70!important; }
+.brand-mark { width: 40px; height: 48px; flex: 0 0 40px; object-fit: contain; display: block; transform-origin: center bottom; }
+.brand-mark:hover { animation: brand-hop 520ms ease-out; }
+@keyframes brand-hop {
+  0%, 100% { transform: translateY(0); }
+  22% { transform: translateY(1px) scale(1.04, .96); }
+  48% { transform: translateY(-7px) scale(.98, 1.02); }
+  76% { transform: translateY(0) scale(1.03, .97); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand-mark:hover { animation: none; }
+}
 .nav-label { font-size: 10px!important; letter-spacing: 0!important; color: #859192; font-weight: 700!important; padding: 0 10px 12px; }
 .nav-item { justify-content: flex-start!important; padding: 11px 12px!important; color: #677577!important; }
 .nav-item .MuiButton-startIcon { margin-right: 12px; }
@@ -12,9 +22,7 @@ body { margin: 0; }
 .privacy-note { padding: 13px; display: flex; gap: 10px; align-items: flex-start; border: 1px solid rgba(120,140,140,.17); }
 .privacy-note .MuiTypography-root { line-height: 1.45; }
 .main { flex: 1; min-width: 0; }
-.topbar { height: 66px; border-bottom: 1px solid rgba(120,140,140,.17); display: flex; align-items: center; justify-content: space-between; padding: 0 42px; }
-.crumb { display: flex; align-items: center; gap: 8px; color: #829092; font-size: 13px; }
-.crumb span { color: inherit; }
+.topbar { height: 66px; border-bottom: 1px solid rgba(120,140,140,.17); display: flex; align-items: center; justify-content: flex-end; padding: 0 42px; }
 .content { max-width: 1050px; margin: 0 auto; padding: 49px 48px 36px; }
 .heading { margin-bottom: 27px; }
 .heading h4,.appearance h4 { font-size: 27px; }
@@ -47,10 +55,10 @@ body { margin: 0; }
 .compact .proxy-row { padding-top: 11px; padding-bottom: 11px; }
 @media (max-width: 760px) {
   .sidebar { width: 65px; flex-basis: 65px; padding: 20px 8px; }
-  .brand { padding: 4px 5px 35px; } .brand > div:not(.MuiAvatar-root), .nav-label { display: none; }
+  .brand { padding: 4px 0 35px; justify-content: center; } .brand-name, .nav-label { display: none!important; }
   .nav-item { min-width: 46px!important; font-size: 0!important; }
   .nav-item .MuiButton-startIcon { margin: 0; }
-  .privacy-note, .sidebar-bottom > .MuiStack-root { display: none; }
+  .privacy-note { display: none; }
   .topbar { padding: 0 18px; }
   .content { padding: 33px 19px; }
   .heading { gap: 15px; flex-direction: column; }

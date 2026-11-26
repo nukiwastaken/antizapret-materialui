@@ -7,10 +7,12 @@ import {
   Tooltip, Typography, createTheme,
 } from "@mui/material";
 import {
-  Brightness4, ContentCopy, Dashboard, ExpandMore, Language,
-  Palette, PlayArrow, Send, Settings, Shield, Stop, Tune, YouTube, AutoFixHigh, Assessment,
+  Brightness4, ContentCopy, Dashboard,
+  Palette, PlayArrow, Send, Shield, Stop, Tune, YouTube, AutoFixHigh, Assessment,
 } from "@mui/icons-material";
 import "./style.css";
+import logo from "../assets/netbridge.png";
+import { version } from "../package.json";
 
 const seed = { accent: "#267b70", mode: "light", radius: 8, compact: false };
 const palettes = ["#267b70", "#315da8", "#b14a45", "#7954a3", "#247b9a", "#60734a"];
@@ -72,23 +74,22 @@ function App() {
       <CssBaseline />
       <Box className={`shell ${prefs.compact ? "compact" : ""}`}>
         <Box component="aside" className="sidebar">
-          <Box className="brand"><Avatar className="brand-mark"><Language /></Avatar><Box><Typography fontWeight={750}>netbridge</Typography><Typography variant="caption" color="text.secondary">ИНТЕРНЕТ БЕЗ ГРАНИЦ</Typography></Box></Box>
+          <Box className="brand"><img className="brand-mark" src={logo} alt="Логотип Netbridge" draggable={false} /><Typography className="brand-name" fontWeight={750}>netbridge</Typography></Box>
           <Typography className="nav-label">РАБОЧЕЕ ПРОСТРАНСТВО</Typography>
           <Button className={`nav-item ${page === "overview" ? "selected" : ""}`} startIcon={<Dashboard />} onClick={() => setPage("overview")}>Обзор</Button>
           <Button className={`nav-item ${page === "appearance" ? "selected" : ""}`} startIcon={<Palette />} onClick={() => setPage("appearance")}>Оформление</Button>
           <Box className="sidebar-bottom">
             <Paper className="privacy-note" elevation={0}><Shield color="primary" fontSize="small" /><Typography variant="caption">Flowseal · ZapretMac 1.1.2<br />TG WS Proxy 1.12.0</Typography></Paper>
-            <Stack direction="row" alignItems="center" spacing={1}><Avatar sx={{ width: 30, height: 30, bgcolor: "primary.main" }}>M</Avatar><Box flex={1}><Typography variant="body2" fontWeight={600}>Мой Mac</Typography><Typography variant="caption" color="text.secondary">Локальное устройство</Typography></Box><Settings fontSize="small" color="action" /></Stack>
           </Box>
         </Box>
         <Box component="main" className="main">
-          <Box className="topbar"><Box className="crumb">Netbridge <ExpandMore fontSize="small" /> <span>{page === "overview" ? "Обзор" : "Оформление"}</span></Box><Tooltip title="Переключить тему"><IconButton onClick={() => savePrefs({ ...prefs, mode: prefs.mode === "light" ? "dark" : "light" })}><Brightness4 /></IconButton></Tooltip></Box>
+          <Box className="topbar"><Tooltip title="Переключить тему"><IconButton onClick={() => savePrefs({ ...prefs, mode: prefs.mode === "light" ? "dark" : "light" })}><Brightness4 /></IconButton></Tooltip></Box>
           {page === "overview" ? <Box className="content">
             <Stack direction="row" justifyContent="space-between" alignItems="flex-start" className="heading">
               <Box><Typography variant="h4" fontWeight={720}>Ваше подключение</Typography><Typography color="text.secondary" mt={0.7}>Управляйте инструментами доступа из одного места.</Typography></Box>
               <Button variant="outlined" startIcon={<Tune />} onClick={() => setPage("appearance")}>Настроить вид</Button>
             </Stack>
-            <Paper className="status-strip" elevation={0}><span className={`live-dot ${active ? "" : "inactive"}`} /><Box flex={1}><Typography fontWeight={650}>{busy ? "Настройка подключения" : active ? `Активных сервисов: ${active}` : "Сервисы выключены"}</Typography><Typography variant="body2" color="text.secondary">{window.netbridge ? "Локальное устройство · macOS" : "Предпросмотр · без доступа к сервисам"}</Typography></Box><Typography variant="caption" color="text.secondary">Netbridge 1.1</Typography></Paper>
+            <Paper className="status-strip" elevation={0}><span className={`live-dot ${active ? "" : "inactive"}`} /><Box flex={1}><Typography fontWeight={650}>{busy ? "Настройка подключения" : active ? `Активных сервисов: ${active}` : "Сервисы выключены"}</Typography><Typography variant="body2" color="text.secondary">{window.netbridge ? "Локальное устройство · macOS" : "Предпросмотр · без доступа к сервисам"}</Typography></Box><Typography variant="caption" color="text.secondary">Netbridge {version}</Typography></Paper>
             <Typography className="section-title">СЕРВИСЫ</Typography>
             <Box className="service-grid">
               <ServiceCard icon={<YouTube />} color="#dc514d" label="ВИДЕО" title="YouTube" desc="ZapretMac · автоматический подбор стратегии" state={services.zapret} onToggle={() => toggle("zapret")} onOptimize={() => action((api) => api.optimize())} onCancel={() => action((api) => api.cancel())} />
@@ -110,7 +111,8 @@ function App() {
       </Box>
       <Dialog open={reportOpen} onClose={() => setReportOpen(false)} fullWidth maxWidth="md">
         <DialogTitle>Результаты автоподбора</DialogTitle><DialogContent>
-          <Typography variant="body2" color="text.secondary" mb={2}>По два запроса к YouTube, превью и маршрутизатору Google Video. Приоритет: число успешных ответов, затем суммарная задержка. Это не тест скорости видеопотока.</Typography>
+          <Typography variant="body2" color="text.secondary" mb={2}>По два HTTPS-запроса к YouTube, превью и маршрутизатору Google Video. Приоритет: число успешных ответов, затем суммарная задержка. Ответ Google Video не подтверждает загрузку видеопотока. Браузерный QUIC/HTTP3 и воспроизведение этим тестом не проверяются.</Typography>
+          {services.zapret.report?.configRevision === "youtube-quic-1" && <Alert severity="info" sx={{ mb: 2 }}>Домены списка Google/YouTube включены в QUIC-профиль. Это настройка правил, а не подтверждение воспроизведения видео.</Alert>}
           <Typography variant="body2">{services.zapret.report?.cached ? "Сохранённый профиль · повторная проверка пройдена" : "Выбранная стратегия"}: {services.zapret.report?.strategy}</Typography>
           <Table size="small"><TableHead><TableRow><TableCell>Стратегия</TableCell><TableCell>HTTPS</TableCell><TableCell>Время, с</TableCell><TableCell>YouTube</TableCell></TableRow></TableHead><TableBody>{(services.zapret.report?.results || "").split("\n").filter(Boolean).map((line) => { const [id, score, time, yt] = line.split("\t"); return <TableRow key={id} selected={id === services.zapret.report?.strategy}><TableCell>{id}</TableCell><TableCell>{score}/6</TableCell><TableCell>{time}</TableCell><TableCell>{yt}/2</TableCell></TableRow>; })}</TableBody></Table>
         </DialogContent><DialogActions><Button onClick={() => setReportOpen(false)}>Закрыть</Button></DialogActions>

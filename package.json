@@ -1,6 +1,6 @@
 {
   "name": "netbridge-mac",
-  "version": "1.1.1",
+  "version": "1.1.5",
   "private": true,
   "description": "A desktop dashboard for Flowseal's ZapretMac and TG WS Proxy",
   "main": "electron/main.cjs",
@@ -35,10 +35,12 @@
     },
     "files": [
       "dist/**/*",
+      "assets/*.png",
       "electron/**/*",
       "package.json"
     ],
     "mac": {
+      "icon": "assets/netbridge.icns",
       "category": "public.app-category.utilities",
       "minimumSystemVersion": "14.0",
       "identity": null,

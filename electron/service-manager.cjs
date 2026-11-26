@@ -7,6 +7,7 @@ const { spawn, execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { EventEmitter } = require("node:events");
 const { ComponentInstaller, component } = require("./components.cjs");
+const { PROFILE_REVISION, adaptZapretPayload } = require("./zapret-compat.cjs");
 
 const execute = promisify(execFile);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -185,16 +186,43 @@ class ServiceManager extends EventEmitter {
   }
 
   async networkKey() {
-    const { stdout } = await this.run("/sbin/route", ["-n", "get", "default"]);
-    const gateway = stdout.match(/gateway:\s*(\S+)/)?.[1];
-    const iface = stdout.match(/interface:\s*(\S+)/)?.[1];
-    if (!gateway || !iface) throw new Error("Не найдено активное сетевое подключение");
-    return createHash("sha256").update(`${gateway}|${iface}|${component("zapret").version}`).digest("hex");
+    for (const args of [["-n", "get", "default"], ["-n", "get", "-inet6", "default"]]) {
+      let stdout;
+      try {
+        ({ stdout } = await this.run("/sbin/route", args, { timeout: 3000 }));
+      } catch {
+        continue;
+      }
+      const gateway = stdout.match(/^\s*gateway:[ \t]*(\S+)/m)?.[1];
+      const iface = stdout.match(/^\s*interface:[ \t]*(\S+)/m)?.[1];
+      if (!iface || iface === "lo0") continue;
+      // Point-to-point routes need no gateway. Their interface alone is not a safe cache identity.
+      if (!gateway) return null;
+      return createHash("sha256").update(`${gateway}|${iface}|${component("zapret").version}|${PROFILE_REVISION}`).digest("hex");
+    }
+    throw new Error("Не найден маршрут в интернет. Проверьте подключение к сети и повторите попытку.");
+  }
+
+  async checkZapretNetwork() {
+    let stdout;
+    try {
+      ({ stdout } = await this.run("/sbin/route", ["-n", "get", "default"], { timeout: 3000 }));
+    } catch {
+      throw new Error("ZapretMac требует подключения IPv4 со шлюзом. Проверьте Wi-Fi или Ethernet и повторите попытку.");
+    }
+    const iface = stdout.match(/^\s*interface:[ \t]*(\S+)/m)?.[1];
+    const gateway = stdout.match(/^\s*gateway:[ \t]*(\S+)/m)?.[1];
+    if (/^(utun|tun|ppp|ipsec|gif|stf)\d+$/.test(iface || "")) {
+      throw new Error(`Маршрут в интернет проходит через туннель ${iface}. ZapretMac не поддерживает такую настройку. Отключите VPN/туннелирование в другом приложении и повторите автоподбор. Netbridge не менял сетевые службы.`);
+    }
+    if (!iface || iface === "lo0" || !net.isIPv4(gateway || "")) {
+      throw new Error("ZapretMac требует подключения IPv4 со шлюзом через Wi-Fi или Ethernet. Текущий маршрут не подходит. Сетевые службы не изменены.");
+    }
   }
 
   async privileged(payload, mode, preferred = "") {
     const work = path.join(this.zapretData, "netbridge-test");
-    for (const name of ["cancel", "best", "progress", "results.tsv", "cached", "outcome"]) {
+    for (const name of ["cancel", "best", "progress", "results.tsv", "cached", "outcome", "failure"]) {
       await fs.rm(path.join(work, name), { force: true });
     }
     const stage = await fs.mkdtemp(path.join(os.tmpdir(), "netbridge-run-"));
@@ -204,6 +232,8 @@ class ServiceManager extends EventEmitter {
     try {
       const source = path.join(stage, "Payload");
       await fs.cp(payload, source, { recursive: true });
+      // Never edit the verified upstream bundle; adapt only the private staging copy.
+      if (mode === "optimize") await adaptZapretPayload(source);
       const runner = path.join(stage, "runner.sh");
       await fs.copyFile(path.join(__dirname, "zapret-runner.sh"), runner);
       const args = ["/bin/sh", runner, source, this.zapretData, process.getuid(), process.getgid(), mode, preferred];
@@ -234,6 +264,12 @@ class ServiceManager extends EventEmitter {
         throw new Error("Операция отменена. Прежние настройки восстановлены.");
       }
       const progress = await readText(path.join(work, "progress"));
+      const failure = await readText(path.join(work, "failure"));
+      if (failure) {
+        const restoration = progress === "Восстановление прежних настроек"
+          ? "Прежние настройки восстановлены." : progress;
+        throw new Error(`${failure}\n${restoration}`);
+      }
       throw new Error(`${progress || "Системная операция не выполнена"}. ${error.stderr || error.message}`);
     } finally {
       finished = true;
@@ -246,6 +282,7 @@ class ServiceManager extends EventEmitter {
   async enableZapret(forceOptimize = false) {
     return this.exclusive("zapret", async () => {
       this.cancelRequested = false;
+      await this.checkZapretNetwork();
       const bundle = await this.installer.ensure("zapret");
       const payload = await this.prepareZapret(bundle);
       const network = await this.networkKey();
@@ -254,7 +291,7 @@ class ServiceManager extends EventEmitter {
       try { profiles = JSON.parse(await readText(profilesFile, "{}")); }
       catch { profiles = {}; }
       if (!profiles || Array.isArray(profiles) || typeof profiles !== "object") profiles = {};
-      const cached = profiles[network];
+      const cached = network ? profiles[network] : undefined;
       const strategies = (await fs.readFile(path.join(payload, "strategies.tsv"), "utf8")).split(/\r?\n/).map((line) => line.split("\t")[0]);
       if (this.cancelRequested) throw new Error("Операция отменена до запуска сервиса");
       const preferred = !forceOptimize && cached && strategies.includes(cached.strategy) ? cached.strategy : "";
@@ -266,10 +303,13 @@ class ServiceManager extends EventEmitter {
       }
       const report = {
         strategy: best, testedAt: new Date().toISOString(), cached: false,
+        configRevision: PROFILE_REVISION,
         results: await readText(path.join(this.zapretData, "netbridge-test/results.tsv")),
       };
-      profiles[network] = report;
-      await atomicWrite(profilesFile, JSON.stringify(profiles, null, 2));
+      if (network) {
+        profiles[network] = report;
+        await atomicWrite(profilesFile, JSON.stringify(profiles, null, 2));
+      }
       this.update("zapret", { report });
     });
   }

@@ -85,6 +85,22 @@ if /usr/bin/pgrep -x ZapretMac >/dev/null 2>&1; then
 fi
 if [ "$MODE" = stop ]; then /bin/sh "$SOURCE/stop.sh"; exit 0; fi
 check_abort
+# The route may change while the macOS authorization dialog is open.
+ROUTE=$(/sbin/route -n get default 2>/dev/null || true)
+IFACE=$(printf '%s\n' "$ROUTE" | /usr/bin/awk '/^[[:space:]]*interface:/{print $2; exit}')
+GATEWAY=$(printf '%s\n' "$ROUTE" | /usr/bin/awk '/^[[:space:]]*gateway:/{print $2; exit}')
+case "$IFACE" in
+    utun[0-9]*|tun[0-9]*|ppp[0-9]*|ipsec[0-9]*|gif[0-9]*|stf[0-9]*)
+        progress "Отключите VPN/туннелирование ($IFACE) и повторите автоподбор. Сетевые службы не изменены."
+        exit 7 ;;
+    ''|lo0)
+        progress 'ZapretMac требует подключения IPv4 со шлюзом через Wi-Fi или Ethernet. Сетевые службы не изменены.'
+        exit 7 ;;
+esac
+if ! printf '%s\n' "$GATEWAY" | /usr/bin/grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    progress 'ZapretMac требует подключения IPv4 со шлюзом через Wi-Fi или Ethernet. Сетевые службы не изменены.'
+    exit 7
+fi
 
 WAS_RUNNING=0
 if /bin/launchctl print system/io.github.flowseal.zapretmac >/dev/null 2>&1 &&
@@ -128,7 +144,12 @@ if [ -n "$PREFERRED" ]; then
     write_state selected-strategy "$PREFERRED"
 fi
 check_abort
-/bin/sh "$SOURCE/install.sh" "$SOURCE" "$DATA"
+if INSTALL_OUTPUT=$(/bin/sh "$SOURCE/install.sh" "$SOURCE" "$DATA" 2>&1); then
+    :
+else
+    printf 'Не удалось запустить ZapretMac: %s\n' "$INSTALL_OUTPUT" | as_user /usr/bin/tee "$WORK/failure" >/dev/null
+    exit 1
+fi
 ready
 probe() {
     NAME=$1
